@@ -27,6 +27,9 @@ from examples.wanvideo.pipeline.mosaic.causal_inference import (
 from examples.wanvideo.pipeline.mosaic.datasets import (
     build_mosaic_validation_dataset,
 )
+from examples.wanvideo.pipeline.mosaic.text_encoder_offload import (
+    maybe_offload_text_encoder,
+)
 from examples.wanvideo.pipeline.mosaic.pipeline_module import (
     WanMosaicPipelineModule,
 )
@@ -165,6 +168,7 @@ def main(argv=None):
         )
     model = build_model(args, accelerator)
     model.eval()
+    maybe_offload_text_encoder(model.pipe)
     run_distilled_inference(
         accelerator,
         input_dataset,

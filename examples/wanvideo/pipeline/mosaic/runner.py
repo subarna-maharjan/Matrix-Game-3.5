@@ -11,6 +11,7 @@ import json
 import os
 import re
 
+from .text_encoder_offload import maybe_offload_text_encoder
 from .validation import run_mosaic_validation
 
 _EPOCH_CKPT_RE = re.compile(r"^epoch-(\d+)\.safetensors$")
@@ -72,6 +73,7 @@ def run_mosaic_inference_task(
             "(num_epochs must be 0)."
         )
     model = accelerator.prepare(model)
+    maybe_offload_text_encoder(accelerator.unwrap_model(model).pipe)
     if getattr(args, "run_sanity_check", False) or getattr(
         args, "run_validation", False
     ):

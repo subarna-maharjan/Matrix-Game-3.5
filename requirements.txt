@@ -6,6 +6,7 @@ numpy
 accelerate
 transformers
 sentencepiece
+ftfy
 peft
 modelscope
 huggingface_hub

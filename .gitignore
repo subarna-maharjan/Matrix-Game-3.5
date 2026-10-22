@@ -6,3 +6,8 @@ test_outputs/
 checkpoints/*
 !checkpoints/.gitkeep
 wandb/
+/data/
+# Slurm job logs written to the submit directory
+/*.out
+# local copy of a dataset sample episode
+/hudnav-20k eval 200/
