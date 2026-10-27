@@ -77,6 +77,9 @@ Override with env vars (`MAX_STEPS`, `CKPT_MIN`, `VAL_MIN`, `HEIGHT`, `WIDTH`,
 | `--val_index PATH` / `--val_every_minutes M` | validation episodes and interval |
 | `--val_draws_per_episode D` | fixed draws per validation episode (default 2) |
 | `--lr_warmup_steps N` | linear warm-up, then constant LR |
+| `--lr_schedule cosine --lr_decay_steps N --lr_min X` | cosine decay to X over N steps from the run's start step (kept on later resumes) |
+| `--gradient_accumulation_steps N` | effective batch = GPUs × N (each step N× slower) |
+| `--loss_avg_window N` | window of the smoothed `train/loss_avgN` curve (default 100) |
 | `--probe_every N` | fixed-draw loss on training clips (for overfitting tests) |
 | `--keep_text_encoder_on_gpu` | default keeps T5 on CPU with cached embeddings (~11 GB GPU saved) |
 
@@ -107,7 +110,9 @@ random timestep, and it does not depend on the number of GPUs.
 
 `wandb login` once (stores the key in `~/.netrc`). Compute nodes reach W&B
 through HPRC's `WebProxy` module, which the Slurm scripts load. Logged:
-`train/loss`, `train/lr`, `train/grad_norm`, `train/loss_mode_*`,
+`train/loss` (raw per step: swings with the random noise level, so read
+the smoothed `train/loss_avg100` / `train/loss_ema` instead),
+`train/samples_seen`, `train/lr`, `train/grad_norm`, `train/loss_mode_*`,
 **`val/loss`**, `val_episode/<id>`, `probe/loss`, `ckpt/saved`; the same
 scalars are written to `<run>/loss_metrics.jsonl` and `<run>/train_log.jsonl`.
 

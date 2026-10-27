@@ -7,11 +7,14 @@
 # The camera is padded to 1 + 84*BLOCKS poses by holding the last pose (8
 # blocks for a 600-frame episode); the result is exported as the episode's
 # frame count at 24 fps, plus a GT | distilled side-by-side and PSNR.
-# Needs a 48 GB A40: even with MG35_T5_OFFLOAD=1 (T5 on CPU) it peaks above
-# 40 GB during DA3 memory registration (DiT + rolling KV cache + DA3).
+#
+# Memory: the released config (7-chunk KV window) at 1280x704 needs more than
+# 48 GB even with MG35_T5_OFFLOAD=1, i.e. an 80 GB GPU. On 40 GB A100s use
+# CONFIG=configs/infer_distilled_8blocks_ctx4.yaml (4-chunk window) or
+# CONFIG=configs/infer_distilled_8blocks_352p.yaml (640x352).
 #SBATCH --job-name=mg35-distilled
-#SBATCH --partition=gpu-a40
-#SBATCH --gres=gpu:a40:1
+#SBATCH --partition=gpu
+#SBATCH --gres=gpu:a100:1
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -26,22 +29,9 @@ BLOCKS=${BLOCKS:-8}
 CONFIG=${CONFIG:-configs/infer_distilled_8blocks.yaml}
 DATA=${DATA:-data/hudnav_overfit}
 OUT=${OUT:-outputs/full_episode}
-ENV_TAR=.cache/env/mg35_env.tar
-ENV_DIR=/tmp/mg35_env
 
 nvidia-smi --query-gpu=name,memory.total --format=csv
-CREATED_ENV=0
-(
-  flock 9
-  if [ ! -x "$ENV_DIR/venv/bin/python" ]; then
-    tar -C /tmp -xf "$ENV_TAR"
-    touch "$ENV_DIR/.created_by_$SLURM_JOB_ID"
-  fi
-) 9>/tmp/mg35_env.lock
-[ -e "$ENV_DIR/.created_by_$SLURM_JOB_ID" ] && CREATED_ENV=1
-cleanup() { [ "$CREATED_ENV" = 1 ] && rm -rf "$ENV_DIR"; }
-trap cleanup EXIT
-PY="$ENV_DIR/venv/bin/python"
+source tools/slurm/lib_env.sh
 export PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # keep the 11 GB T5 on CPU between prompt encodings so generation fits a 40 GB A100

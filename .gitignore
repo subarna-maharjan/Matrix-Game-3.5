@@ -9,5 +9,6 @@ wandb/
 /data/
 # Slurm job logs written to the submit directory
 /*.out
+/*.log
 # local copy of a dataset sample episode
 /hudnav-20k eval 200/

@@ -39,26 +39,12 @@ fi
 BLOCKS=${BLOCKS:-8}
 DATA=${DATA:-data/hudnav_overfit}
 OUT=${OUT:-outputs/full_episode}
-ENV_TAR=.cache/env/mg35_env.tar
-ENV_DIR=/tmp/mg35_env
 
 nvidia-smi --query-gpu=name,memory.total --format=csv
-CREATED_ENV=0
-(
-  flock 9
-  if [ ! -x "$ENV_DIR/venv/bin/python" ]; then
-    tar -C /tmp -xf "$ENV_TAR"
-    touch "$ENV_DIR/.created_by_$SLURM_JOB_ID"
-  fi
-) 9>/tmp/mg35_env.lock
-[ -e "$ENV_DIR/.created_by_$SLURM_JOB_ID" ] && CREATED_ENV=1
+source tools/slurm/lib_env.sh
 MERGED=""
-cleanup() {
-  [ -n "$MERGED" ] && rm -f "$MERGED"
-  [ "$CREATED_ENV" = 1 ] && rm -rf "$ENV_DIR"
-}
-trap cleanup EXIT
-PY="$ENV_DIR/venv/bin/python"
+cleanup_merged() { [ -n "$MERGED" ] && rm -f "$MERGED"; _mg35_release_env; }
+trap cleanup_merged EXIT
 export PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # keep the 11 GB T5 on CPU between prompt encodings so generation fits a 40 GB A100

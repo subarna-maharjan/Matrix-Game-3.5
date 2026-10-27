@@ -30,6 +30,13 @@ Extra flags handled here (everything else is a pipeline flag / config key):
     --probe_samples K     number of fixed draws in the probe (default 4)
     --keep_text_encoder_on_gpu  keep T5 on the GPU (default: CPU + cached
                           prompt embeddings, saves ~11 GB of GPU memory)
+    --lr_schedule constant|cosine  default: the checkpoint's schedule when
+                          resuming, else constant (after --lr_warmup_steps)
+    --lr_decay_steps N / --lr_decay_start S / --lr_min X  cosine decay from the
+                          base LR to X over N steps starting at global step S
+                          (default S: the step this run starts from)
+    --loss_avg_window N   window of train/loss_avgN in W&B (default 100);
+                          train/loss_ema and train/samples_seen are logged too
 
 Full checkpoints land in <output_path>/<run>/checkpoints/step-NNNNNNN/
 (weights.safetensors, optimizer.pt, rng_rank*.pt, state.json); the weights
@@ -43,12 +50,14 @@ import copy
 import glob
 import importlib
 import json
+import math
 import os
 import random
 import re
 import shutil
 import sys
 import time
+from collections import deque
 
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
 if REPO_DIR not in sys.path:
@@ -82,6 +91,13 @@ def _parse_finetune_flags(argv):
     parser.add_argument("--probe_every", type=int, default=0)
     parser.add_argument("--probe_samples", type=int, default=4)
     parser.add_argument("--keep_text_encoder_on_gpu", action="store_true")
+    parser.add_argument("--lr_schedule", choices=["constant", "cosine"], default=None,
+                        help="default: the checkpoint's schedule when resuming, else constant")
+    parser.add_argument("--lr_decay_steps", type=int, default=None)
+    parser.add_argument("--lr_decay_start", type=int, default=None,
+                        help="global step where cosine decay starts (default: this run's start)")
+    parser.add_argument("--lr_min", type=float, default=None)
+    parser.add_argument("--loss_avg_window", type=int, default=100)
     return parser.parse_known_args(argv)
 
 
@@ -153,6 +169,9 @@ def _fixed_draw_losses(accelerator, model, dataset, indices, seed_base):
     saved_offset = getattr(dataset, "_epoch_offset", 0)
     saved_step = module.step_count
     saved_py = random.getstate()
+    # text dropout is a training augmentation; keep evaluation on the caption
+    saved_dropout = getattr(module, "train_prompt_dropout_prob", 0.0)
+    module.train_prompt_dropout_prob = 0.0
     devices = [accelerator.device] if accelerator.device.type == "cuda" else []
     out = {}
     try:
@@ -172,6 +191,7 @@ def _fixed_draw_losses(accelerator, model, dataset, indices, seed_base):
         dataset._epoch_id = saved_epoch
         dataset._epoch_offset = saved_offset
         module.step_count = saved_step
+        module.train_prompt_dropout_prob = saved_dropout
         random.setstate(saved_py)
     return out
 
@@ -362,18 +382,43 @@ def run_mosaic_training_task(
         trainable, lr=args.learning_rate, weight_decay=args.weight_decay
     )
     warmup = max(0, int(FT.lr_warmup_steps))
-    schedule = {"type": "constant_with_warmup", "base_lr": float(args.learning_rate),
+    resume = _read_ckpt_state(FT.resume_ckpt) if FT.resume_ckpt else None
+
+    # LR schedule: linear warm-up, then constant or cosine decay. An explicit
+    # --lr_schedule wins; otherwise a resumed run keeps its checkpoint's
+    # schedule, so restarting a cosine run continues the same curve.
+    saved = (resume or {}).get("lr_schedule") or {}
+    sched_type = FT.lr_schedule or saved.get("type", "constant")
+    sched_type = "cosine" if sched_type == "cosine" else "constant_with_warmup"
+    schedule = {"type": sched_type, "base_lr": float(args.learning_rate),
                 "warmup_steps": warmup}
+    if sched_type == "cosine":
+        from_ckpt = saved.get("type") == "cosine"
+        start = FT.lr_decay_start
+        if start is None:
+            start = saved["decay_start"] if from_ckpt else int((resume or {}).get("global_step", 0))
+        decay_steps = FT.lr_decay_steps or (saved.get("decay_steps") if from_ckpt else None)
+        if not decay_steps:
+            raise SystemExit("ERROR: --lr_schedule cosine needs --lr_decay_steps")
+        min_lr = FT.lr_min if FT.lr_min is not None else (saved.get("min_lr", 0.0) if from_ckpt else 0.0)
+        schedule.update(decay_start=int(start), decay_steps=int(decay_steps), min_lr=float(min_lr))
 
     def lr_at(step):
-        # Linear warm-up then constant. Set by hand per optimizer update: a
-        # prepared torch scheduler would advance num_processes times per
-        # update and distort the warm-up; the schedule is a pure function of
-        # the step, so the step in state.json fully restores it.
-        return args.learning_rate * (min(1.0, (step + 1) / warmup) if warmup else 1.0)
+        # Set by hand per optimizer update: a prepared torch scheduler would
+        # advance num_processes times per update and distort it. The schedule
+        # is a pure function of the step, so state.json fully restores it.
+        base = args.learning_rate
+        if warmup and step < warmup:
+            return base * (step + 1) / warmup
+        if schedule["type"] == "cosine":
+            t = min(1.0, max(0, step - schedule["decay_start"]) / schedule["decay_steps"])
+            return schedule["min_lr"] + (base - schedule["min_lr"]) * 0.5 * (1 + math.cos(math.pi * t))
+        return base
+
+    if accelerator.is_main_process:
+        print(f"[finetune] LR schedule: {schedule}", flush=True)
 
     # ---- resume state (weights were already loaded via --lora_checkpoint) --
-    resume = _read_ckpt_state(FT.resume_ckpt) if FT.resume_ckpt else None
     if resume is not None:
         if int(resume["dataset_pass_id"]) != int(args.dataset_pass_id):
             raise SystemExit(
@@ -424,7 +469,12 @@ def run_mosaic_training_task(
             _set_rng_state(torch.load(rng_path, map_location="cpu", weights_only=False))
         elif accelerator.is_main_process:
             print("[finetune] resume: world size changed; RNG streams re-seeded")
-        accelerator.unwrap_model(model).step_count = global_step
+        # the module counts forward passes (keys the memory schedule and the
+        # anchor/context plan); with gradient accumulation that is not the
+        # optimizer step, so restore the saved counter
+        accelerator.unwrap_model(model).step_count = int(
+            resume.get("model_step_count", global_step)
+        )
         if accelerator.is_main_process:
             print(
                 f"[finetune] resume from {FT.resume_ckpt}: step {global_step}, epoch "
@@ -487,6 +537,13 @@ def run_mosaic_training_task(
         write_log({"step": step, "probe_loss": mean, "probe_losses": per_sample})
 
     samples_per_batch = accelerator.num_processes  # batch size 1 per rank
+    samples_per_step = samples_per_batch * max(1, int(args.gradient_accumulation_steps or 1))
+    loss_window = deque(maxlen=max(1, int(FT.loss_avg_window)))
+    loss_ema = None
+    # running total, since the batch size can change between resumed legs
+    # (checkpoints before this field: every step used world_size samples)
+    samples_seen = int((resume or {}).get(
+        "samples_seen", global_step * int((resume or {}).get("world_size", samples_per_batch))))
 
     def checkpoint(epoch_id, samples_in_epoch):
         state = {
@@ -499,6 +556,9 @@ def run_mosaic_training_task(
             "lora": is_lora,
             "lr_schedule": dict(schedule, last_step=global_step),
             "wandb_run_id": wandb_id,
+            "model_step_count": int(accelerator.unwrap_model(model).step_count),
+            "samples_seen": samples_seen,
+            "grad_accum": int(args.gradient_accumulation_steps or 1),
             "time": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
         path = _save_checkpoint(accelerator, model, optimizer, log_dir, state,
@@ -557,6 +617,7 @@ def run_mosaic_training_task(
                 continue
 
             global_step += 1
+            samples_seen += samples_per_step
             metrics.log_train_step(
                 loss=step_loss / step_n,
                 loss_local=step_loss_local / step_n,
@@ -566,14 +627,29 @@ def run_mosaic_training_task(
                 data=data,
                 nonfinite=not torch.isfinite(loss.detach()).all().item(),
             )
+            # The per-step loss swings with the randomly drawn noise level
+            # (~0.02 near-clean .. ~0.8 near-pure noise), so log smoothed
+            # versions alongside it to make the trend readable.
+            loss_window.append(step_loss / step_n)
+            loss_ema = (step_loss / step_n) if loss_ema is None else (
+                0.99 * loss_ema + 0.01 * (step_loss / step_n))
+            scalars = {
+                f"train/loss_avg{loss_window.maxlen}": float(np.mean(loss_window)),
+                "train/loss_ema": float(loss_ema),
+                "train/samples_seen": float(samples_seen),
+            }
             if grad_norm is not None:
-                metrics.log_scalars({"train/grad_norm": float(grad_norm)}, step=global_step)
+                scalars["train/grad_norm"] = float(grad_norm)
+            metrics.log_scalars(scalars, step=global_step)
             step_loss, step_loss_local, step_n = 0.0, 0.0, 0
             if global_step % max(1, FT.log_every) == 0 and accelerator.is_main_process:
                 record = {
                     "step": global_step,
                     "epoch": epoch_id,
                     "loss": running / max(1, running_n),
+                    f"loss_avg{loss_window.maxlen}": float(np.mean(loss_window)),
+                    "loss_ema": float(loss_ema),
+                    "samples_seen": samples_seen,
                     "lr": optimizer.param_groups[0]["lr"],
                     "grad_norm": None if grad_norm is None else float(grad_norm),
                     "sec_per_step": (time.time() - t_log) / FT.log_every,

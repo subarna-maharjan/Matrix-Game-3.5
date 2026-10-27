@@ -39,8 +39,6 @@ DATA=${DATA:-data/hudnav_overfit}
 RUN="overfit${RUN_TAG:+_$RUN_TAG}_${SLURM_JOB_ID}"
 read -r -a TRAIN_EXTRA_ARR <<< "${TRAIN_EXTRA:-}"
 read -r -a INFER_EXTRA_ARR <<< "${INFER_EXTRA:-}"
-ENV_TAR=.cache/env/mg35_env.tar          # built by packing /tmp/mg35_env
-ENV_DIR=/tmp/mg35_env                     # paths inside the env are absolute
 
 # Compute nodes have no direct internet; HPRC's WebProxy module lets W&B
 # sync live. The logger's reachability probe is a direct TCP connect that
@@ -55,20 +53,7 @@ fi
 nvidia-smi --query-gpu=name,memory.total --format=csv
 df -h /tmp | tail -1
 
-# ---- environment (node-local; the env is ~42k files) ----------------------
-CREATED_ENV=0
-(
-  flock 9
-  if [ ! -x "$ENV_DIR/venv/bin/python" ]; then
-    echo "[overfit] unpacking $ENV_TAR -> /tmp"
-    tar -C /tmp -xf "$ENV_TAR"
-    touch "$ENV_DIR/.created_by_$SLURM_JOB_ID"
-  fi
-) 9>/tmp/mg35_env.lock
-[ -e "$ENV_DIR/.created_by_$SLURM_JOB_ID" ] && CREATED_ENV=1
-cleanup() { [ "$CREATED_ENV" = 1 ] && rm -rf "$ENV_DIR"; }
-trap cleanup EXIT
-PY="$ENV_DIR/venv/bin/python"
+source tools/slurm/lib_env.sh
 export PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export DA3_MODEL_PATH="$PWD/checkpoints/DA3NESTED-GIANT-LARGE-1.1"

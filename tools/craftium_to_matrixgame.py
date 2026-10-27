@@ -204,6 +204,9 @@ def main():
         "--first", type=int, default=None,
         help="With --splits: only the first N episodes of the split, in file order.",
     )
+    parser.add_argument("--num-shards", type=int, default=1)
+    parser.add_argument("--shard-id", type=int, default=0,
+                        help="Convert episodes shard-id, shard-id+num-shards, ...")
     args = parser.parse_args()
 
     if args.splits:
@@ -214,6 +217,7 @@ def main():
         episodes = find_episodes(args.src)
     if args.limit is not None:
         episodes = episodes[: args.limit]
+    episodes = episodes[args.shard_id :: args.num_shards]
     if not episodes:
         sys.exit(f"ERROR: no episodes (rgb.mp4 + data.npz) found under {args.src}")
 
